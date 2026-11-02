@@ -1,0 +1,4 @@
+streamlit
+sentence-transformers
+pillow
+torch --index-url https://pytorch.org
