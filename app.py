@@ -16,7 +16,6 @@ st.write("Upload a `.zip` file of images, then search through them using natural
 # 1. Load the CLIP Model (Cached)
 @st.cache_resource
 def load_model():
-    # Utilizing OpenAI's CLIP model via sentence-transformers wrapper
     return SentenceTransformer('clip-ViT-B-32')
 
 try:
@@ -48,7 +47,6 @@ if uploaded_zip is not None:
         supported_extensions = (".png", ".jpg", ".jpeg", ".webp")
         image_paths = []
         
-        # Walk through the directory (handles nested folders inside the zip)
         for root, _, files in os.walk(directory):
             for file in files:
                 if file.lower().endswith(supported_extensions):
@@ -60,19 +58,17 @@ if uploaded_zip is not None:
         loaded_images = []
         valid_paths = []
         
-        # Load and convert to RGB format required by CLIP
         for path in image_paths:
             try:
                 img = Image.open(path).convert("RGB")
                 loaded_images.append(img)
                 valid_paths.append(path)
             except Exception:
-                continue # Skip unreadable or corrupted files
+                continue # Skip unreadable files
                 
         if not loaded_images:
             return [], None
 
-        # Generate vectors (embeddings)
         with torch.no_grad():
             image_embeddings = model.encode(loaded_images, convert_to_tensor=True, show_progress_bar=False)
             
@@ -80,33 +76,33 @@ if uploaded_zip is not None:
 
     image_paths, image_embeddings = index_extracted_images(TEMP_DIR)
 
-    # 4. Search UI logic
-    if not image_paths:
-        st.warning("⚠️ No valid images (.jpg, .jpeg, .png, .webp) found inside the uploaded zip file.")
+    # 4. Search UI logic with Safety Checks
+    # FIX: Check if image_embeddings is None or empty before continuing
+    if not image_paths or image_embeddings is None or len(image_embeddings) == 0:
+        st.warning("⚠️ No valid images found inside the uploaded zip file. Please make sure the zip file contains standard images like .jpg or .png.")
     else:
         st.success(f"✅ Successfully indexed {len(image_paths)} images from your zip file!")
         st.divider()
         
-        # User query input
         st.subheader("Step 2: Search your Library")
-        query = st.text_input("Enter a text description to find your image:", placeholder="e.g., a sunny beach, close up photo of a cat, red car...")
+        query = st.text_input("Enter a text description to find your image:", placeholder="e.g., a sunny beach, close up photo of a cat...")
         
         if query:
-            # Vectorize the text query
             with torch.no_grad():
                 text_embedding = model.encode(query, convert_to_tensor=True)
                 
-            # Compute similarity metrics between the text concept and images
             cos_scores = util.cos_sim(text_embedding, image_embeddings)
             
-            # Extract top matching record
-            best_match_idx = int(torch.argmax(cos_scores).item())
-            best_score = cos_scores[best_match_idx].item()
-            matched_image_path = image_paths[best_match_idx]
-            
-            # Render match results to screen
-            st.markdown("### 🏆 Best Match Found")
-            st.image(matched_image_path, use_container_width=True)
-            st.caption(f"**Filename:** {os.path.basename(matched_image_path)} | **Confidence Score:** {best_score:.4f}")
+            # Additional safety layer before calling argmax
+            if cos_scores.numel() > 0:
+                best_match_idx = int(torch.argmax(cos_scores).item())
+                best_score = cos_scores[best_match_idx].item()
+                matched_image_path = image_paths[best_match_idx]
+                
+                st.markdown("### 🏆 Best Match Found")
+                st.image(matched_image_path, use_container_width=True)
+                st.caption(f"**Filename:** {os.path.basename(matched_image_path)} | **Confidence Score:** {best_score:.4f}")
+            else:
+                st.error("Could not calculate scores for this search. Please try a different query.")
 else:
     st.info("💡 Please upload a zip file filled with pictures above to activate the system search features.")
