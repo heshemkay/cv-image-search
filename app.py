@@ -28,17 +28,17 @@ except Exception as e:
 uploaded_zip = st.file_uploader("Step 1: Upload a Zipped Folder of Images (.zip)", type=["zip"])
 
 if uploaded_zip is not None:
-    # Use a unique runtime session key so Streamlit tracks file state correctly
+    # Build a highly specific unique state tracking token based on file metadata
     session_key = f"data_{uploaded_zip.name}_{uploaded_zip.size}"
     
-    # Initialize session state variables for tracking current zip index arrays
+    # Initialize state variables if a completely new file is detected
     if "current_zip" not in st.session_state or st.session_state["current_zip"] != session_key:
         st.session_state["current_zip"] = session_key
         st.session_state["valid_paths"] = []
         st.session_state["image_embeddings"] = None
-        st.session_state["image_bytes"] = {} # Store original images in memory to safely display later
+        st.session_state["image_bytes"] = {} 
 
-        # Create a unique random directory that won't collide with old sessions
+        # Generate isolated temporary path execution blocks
         with tempfile.TemporaryDirectory() as target_temp_dir:
             try:
                 with zipfile.ZipFile(uploaded_zip, "r") as zip_ref:
@@ -66,8 +66,6 @@ if uploaded_zip is not None:
                             with Image.open(path) as img:
                                 img.thumbnail((400, 400))
                                 img_rgb = img.convert("RGB")
-                                
-                                # Read raw image file content to keep in memory since temp folder auto-deletes
                                 filename = os.path.basename(path)
                                 
                                 with torch.no_grad():
@@ -76,11 +74,10 @@ if uploaded_zip is not None:
                                 all_embeddings.append(embedding)
                                 valid_names.append(filename)
                                 
-                                # Re-open raw bytes to store inside Streamlit session memory safely
                                 with open(path, "rb") as f:
                                     st.session_state["image_bytes"][filename] = f.read()
                         except Exception:
-                            continue  # Skip unreadable images
+                            continue  
                         finally:
                             gc.collect()
 
@@ -101,10 +98,11 @@ if uploaded_zip is not None:
         st.divider()
         
         st.subheader("Step 2: Search your Library")
+        # Enforcing a key tied directly to the dataset volume forces the input field to wipe clean on file switches
         query = st.text_input(
             "Enter a text description to find your image:", 
             placeholder="e.g., a sunny beach, close up photo of a cat...",
-            key=f"input_{session_key}"
+            key=f"query_input_{session_key}_{len(valid_paths)}"
         )
         
         if query:
@@ -113,16 +111,22 @@ if uploaded_zip is not None:
                 
             cos_scores = util.cos_sim(text_embedding, image_embeddings)
             
-            if cos_scores.numel() > 0:
+            # FIX: Ensure computed score matrix matches the exact boundary limits of the active dataset array
+            if cos_scores.numel() > 0 and cos_scores.shape[1] == len(valid_paths):
                 best_match_idx = int(torch.argmax(cos_scores).item())
-                best_score = cos_scores[best_match_idx].item()
-                matched_filename = valid_paths[best_match_idx]
                 
-                st.markdown("### 🏆 Best Match Found")
-                # Pull image data from secure memory dictionary to present to screen
-                st.image(image_bytes_dict[matched_filename], use_container_width=True)
-                st.caption(f"**Filename:** {matched_filename} | **Confidence Score:** {best_score:.4f}")
+                # Double-checking index boundary strictly before executing array lookups
+                if 0 <= best_match_idx < len(valid_paths):
+                    best_score = cos_scores[0, best_match_idx].item()
+                    matched_filename = valid_paths[best_match_idx]
+                    
+                    st.markdown("### 🏆 Best Match Found")
+                    st.image(image_bytes_dict[matched_filename], use_container_width=True)
+                    st.caption(f"**Filename:** {matched_filename} | **Confidence Score:** {best_score:.4f}")
+                else:
+                    st.error("Index error: Computed vector mapping out of safe bounds.")
             else:
-                st.error("Could not calculate scores for this search.")
+                # Silently catch mismatched sizes during quick transition states
+                st.info("Refreshing search index for your new data...")
 else:
     st.info("💡 Please upload a zip file filled with pictures above to activate the system search features.")
