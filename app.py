@@ -2,13 +2,11 @@ import os
 import zipfile
 import shutil
 import gc
+import tempfile
 import streamlit as st
 import torch
 from PIL import Image
 from sentence_transformers import SentenceTransformer, util
-
-# Configuration for temporary extraction
-TEMP_DIR = "extracted_images"
 
 st.set_page_config(page_title="Text-to-Image Search", page_icon="🖼️", layout="centered")
 st.title("🖼️ Mini Text-to-Image Search System")
@@ -30,84 +28,101 @@ except Exception as e:
 uploaded_zip = st.file_uploader("Step 1: Upload a Zipped Folder of Images (.zip)", type=["zip"])
 
 if uploaded_zip is not None:
-    # We clear out older extraction folders on fresh uploads
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    # Use a unique runtime session key so Streamlit tracks file state correctly
+    session_key = f"data_{uploaded_zip.name}_{uploaded_zip.size}"
     
-    try:
-        with zipfile.ZipFile(uploaded_zip, "r") as zip_ref:
-            zip_ref.extractall(TEMP_DIR)
-    except Exception as e:
-        st.error(f"Failed to extract zip file: {e}")
-        st.stop()
+    # Initialize session state variables for tracking current zip index arrays
+    if "current_zip" not in st.session_state or st.session_state["current_zip"] != session_key:
+        st.session_state["current_zip"] = session_key
+        st.session_state["valid_paths"] = []
+        st.session_state["image_embeddings"] = None
+        st.session_state["image_bytes"] = {} # Store original images in memory to safely display later
 
-    # 3. Dynamic Image Indexing Loop (WITHOUT @st.cache_data to prevent stale index mixups)
-    # Removing st.cache_data ensures the image vectors exactly match your uploaded files *right now*
-    with st.spinner("Analyzing and indexing images sequentially... 🧠"):
-        supported_extensions = (".png", ".jpg", ".jpeg", ".webp")
-        image_paths = []
+        # Create a unique random directory that won't collide with old sessions
+        with tempfile.TemporaryDirectory() as target_temp_dir:
+            try:
+                with zipfile.ZipFile(uploaded_zip, "r") as zip_ref:
+                    zip_ref.extractall(target_temp_dir)
+            except Exception as e:
+                st.error(f"Failed to extract zip file: {e}")
+                st.stop()
+
+            # 3. Dynamic Image Indexing Loop
+            with st.spinner("Analyzing and indexing images sequentially... 🧠"):
+                supported_extensions = (".png", ".jpg", ".jpeg", ".webp")
+                raw_paths = []
+                
+                for root, _, files in os.walk(target_temp_dir):
+                    for file in files:
+                        if file.lower().endswith(supported_extensions):
+                            raw_paths.append(os.path.join(root, file))
+                            
+                if raw_paths:
+                    all_embeddings = []
+                    valid_names = []
+                    
+                    for path in raw_paths:
+                        try:
+                            with Image.open(path) as img:
+                                img.thumbnail((400, 400))
+                                img_rgb = img.convert("RGB")
+                                
+                                # Read raw image file content to keep in memory since temp folder auto-deletes
+                                filename = os.path.basename(path)
+                                
+                                with torch.no_grad():
+                                    embedding = model.encode(img_rgb, convert_to_tensor=True, show_progress_bar=False)
+                                
+                                all_embeddings.append(embedding)
+                                valid_names.append(filename)
+                                
+                                # Re-open raw bytes to store inside Streamlit session memory safely
+                                with open(path, "rb") as f:
+                                    st.session_state["image_bytes"][filename] = f.read()
+                        except Exception:
+                            continue  # Skip unreadable images
+                        finally:
+                            gc.collect()
+
+                    if all_embeddings:
+                        st.session_state["image_embeddings"] = torch.stack(all_embeddings)
+                        st.session_state["valid_paths"] = valid_names
+
+    # Pull active data state out of session memory 
+    valid_paths = st.session_state["valid_paths"]
+    image_embeddings = st.session_state["image_embeddings"]
+    image_bytes_dict = st.session_state["image_bytes"]
+
+    # 4. Search UI logic 
+    if not valid_paths or image_embeddings is None:
+        st.warning("⚠️ No valid images found inside the uploaded zip file. Ensure it contains formats like .jpg or .png.")
+    else:
+        st.success(f"✅ Successfully indexed {len(valid_paths)} images safely!")
+        st.divider()
         
-        for root, _, files in os.walk(TEMP_DIR):
-            for file in files:
-                if file.lower().endswith(supported_extensions):
-                    image_paths.append(os.path.join(root, file))
-                    
-        if not image_paths:
-            st.warning("⚠️ No valid images found. Ensure your zip contains standard formats like .jpg or .png.")
-        else:
-            valid_paths = []
-            all_embeddings = []
+        st.subheader("Step 2: Search your Library")
+        query = st.text_input(
+            "Enter a text description to find your image:", 
+            placeholder="e.g., a sunny beach, close up photo of a cat...",
+            key=f"input_{session_key}"
+        )
+        
+        if query:
+            with torch.no_grad():
+                text_embedding = model.encode(query, convert_to_tensor=True)
+                
+            cos_scores = util.cos_sim(text_embedding, image_embeddings)
             
-            # Process sequentially to keep memory low
-            for path in image_paths:
-                try:
-                    with Image.open(path) as img:
-                        img.thumbnail((400, 400))
-                        img_rgb = img.convert("RGB")
-                        
-                        with torch.no_grad():
-                            embedding = model.encode(img_rgb, convert_to_tensor=True, show_progress_bar=False)
-                        
-                        all_embeddings.append(embedding)
-                        valid_paths.append(path)
-                except Exception:
-                    continue  # Skip unreadable images
-                finally:
-                    gc.collect()
-
-            if not all_embeddings:
-                st.error("Could not read any images from the folder.")
+            if cos_scores.numel() > 0:
+                best_match_idx = int(torch.argmax(cos_scores).item())
+                best_score = cos_scores[best_match_idx].item()
+                matched_filename = valid_paths[best_match_idx]
+                
+                st.markdown("### 🏆 Best Match Found")
+                # Pull image data from secure memory dictionary to present to screen
+                st.image(image_bytes_dict[matched_filename], use_container_width=True)
+                st.caption(f"**Filename:** {matched_filename} | **Confidence Score:** {best_score:.4f}")
             else:
-                image_embeddings = torch.stack(all_embeddings)
-                
-                # 4. Search UI logic 
-                st.success(f"✅ Successfully indexed {len(valid_paths)} images safely!")
-                st.divider()
-                
-                st.subheader("Step 2: Search your Library")
-                # Using a unique key bound to the zip file ensures the input field clears out when a new zip drops
-                query = st.text_input(
-                    "Enter a text description to find your image:", 
-                    placeholder="e.g., a sunny beach, close up photo of a cat...",
-                    key=f"query_{uploaded_zip.name}_{len(valid_paths)}"
-                )
-                
-                if query:
-                    with torch.no_grad():
-                        text_embedding = model.encode(query, convert_to_tensor=True)
-                        
-                    cos_scores = util.cos_sim(text_embedding, image_embeddings)
-                    
-                    if cos_scores.numel() > 0:
-                        best_match_idx = int(torch.argmax(cos_scores).item())
-                        best_score = cos_scores[best_match_idx].item()
-                        matched_image_path = valid_paths[best_match_idx]
-                        
-                        st.markdown("### 🏆 Best Match Found")
-                        st.image(matched_image_path, use_container_width=True)
-                        st.caption(f"**Filename:** {os.path.basename(matched_image_path)} | **Confidence Score:** {best_score:.4f}")
-                    else:
-                        st.error("Could not calculate scores for this search.")
+                st.error("Could not calculate scores for this search.")
 else:
     st.info("💡 Please upload a zip file filled with pictures above to activate the system search features.")
